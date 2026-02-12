@@ -1,3 +1,11 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Ignore data but keep directories
+data/processed/*
+!data/processed/.gitkeep
+data/raw/*
+!data/raw/.gitkeep
+data/splits/*
+!data/splits/.gitkeep
