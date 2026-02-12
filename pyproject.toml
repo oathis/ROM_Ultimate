@@ -1,0 +1,9 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rom-ultimate"
+version = "0.1.0"
+description = "Config-driven ROM pipeline skeleton"
+requires-python = ">=3.10"

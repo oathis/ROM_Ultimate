@@ -1,0 +1,13 @@
+dataset:
+  name: default
+mode:
+  name: pod
+  rank: 32
+offline:
+  name: rbf
+  kernel: gaussian
+online:
+  runner: static
+paths:
+  mode_artifact: artifacts/modes/pod_rank32.pkl
+  model_artifact: artifacts/models/rbf_gaussian.pkl
