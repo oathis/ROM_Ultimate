@@ -9,3 +9,11 @@ data/raw/*
 !data/raw/.gitkeep
 data/splits/*
 !data/splits/.gitkeep
+
+# Generated ROM outputs (do not commit large artifacts)
+models/
+predictions/
+
+# Generated media/debug outputs
+*.gif
+*.mp4
