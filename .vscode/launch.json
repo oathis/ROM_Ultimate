@@ -1,0 +1,32 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "ROM Web App (Streamlit)",
+      "type": "python",
+      "request": "launch",
+      "module": "streamlit",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "run",
+        "${workspaceFolder}/scripts/run_web_app.py",
+        "--server.address",
+        "127.0.0.1",
+        "--server.port",
+        "8501",
+        "--server.headless",
+        "false"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src;${workspaceFolder}/scripts"
+      },
+      "serverReadyAction": {
+        "action": "openExternally",
+        "pattern": "URL:\\s+(https?://\\S+)",
+        "uriFormat": "%s"
+      }
+    }
+  ]
+}

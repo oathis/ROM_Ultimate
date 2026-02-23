@@ -13,6 +13,16 @@ data/splits/*
 # Generated ROM outputs (do not commit large artifacts)
 models/
 predictions/
+artifacts/models/*
+!artifacts/models/.gitkeep
+artifacts/modes/*
+!artifacts/modes/.gitkeep
+artifacts/reports/*
+!artifacts/reports/.gitkeep
+artifacts/scalers/*
+!artifacts/scalers/.gitkeep
+artifacts/sessions/*
+!artifacts/sessions/.gitkeep
 
 # Generated media/debug outputs
 *.gif
