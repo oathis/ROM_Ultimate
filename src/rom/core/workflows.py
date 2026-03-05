@@ -1,16 +1,51 @@
 from pathlib import Path
 import json
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 
 from rom.core.factory import build_mode, build_runner, build_trainer
 from rom.data.preprocess import process_transient_data
+from rom.data.split import (
+    build_raw_split_manifest,
+    load_split_manifest,
+    save_split_manifest,
+    subset_files_from_manifest,
+)
 from rom.runners.online_prediction import OnlinePredictionRunner
 
 
 def _discover_snapshots(processed_dir: Path):
     return sorted(processed_dir.glob("Snapshot_*.npy"))
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _to_jsonable(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        out = {}
+        for key, val in value.items():
+            if key == "time_values":
+                continue
+            out[str(key)] = _to_jsonable(val)
+        return out
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
+
+
+def _write_json(path: Path, payload: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def _resolve_eval_modes(eval_mode: str):
@@ -107,14 +142,130 @@ def _regression_metrics(y_true: np.ndarray, y_pred: np.ndarray):
     }
 
 
-def run_preprocess(raw_dir: Path, processed_dir: Path):
+def _field_column_for_variable(variable: str):
+    mapping = {
+        "T": "temperature",
+        "u": "x-velocity",
+        "v": "y-velocity",
+        "w": "z-velocity",
+    }
+    return mapping.get(variable, variable)
+
+
+def run_dataset_split(
+    raw_dir: Path,
+    output_path: Path,
+    split_mode: str = "extrapolation",
+    test_ratio: float = 0.2,
+    min_train_samples: int = 8,
+    split_id: str | None = None,
+):
+    raw_dir = Path(raw_dir)
+    output_path = Path(output_path)
+    manifest = build_raw_split_manifest(
+        raw_dir=raw_dir,
+        mode=split_mode,
+        test_ratio=float(test_ratio),
+        min_train_samples=int(min_train_samples),
+        split_id=split_id,
+    )
+    saved_path = save_split_manifest(output_path, manifest)
+    manifest["manifest_path"] = str(saved_path)
+    return manifest
+
+
+def run_preprocess(
+    raw_dir: Path,
+    processed_dir: Path,
+    split_manifest_path: Path | None = None,
+    subset: str = "all",
+):
     raw_dir = Path(raw_dir)
     processed_dir = Path(processed_dir)
-    process_transient_data(raw_dir, processed_dir)
-    return {
+
+    selected_files = None
+    split_manifest = None
+    subset_norm = str(subset or "all").strip().lower()
+
+    def _build_dataset_manifest(target_dir: Path, target_subset: str, target_selected_files):
+        return {
+            "updated_at": _now_iso(),
+            "raw_dir": str(raw_dir),
+            "processed_dir": str(target_dir),
+            "subset": target_subset,
+            "split_manifest_path": None if split_manifest_path is None else str(Path(split_manifest_path)),
+            "split_mode": None if split_manifest is None else split_manifest.get("split_mode"),
+            "n_train": None if split_manifest is None else split_manifest.get("n_train"),
+            "n_test": None if split_manifest is None else split_manifest.get("n_test"),
+            "selected_files": None if target_selected_files is None else int(len(target_selected_files)),
+            "snapshots": [p.name for p in _discover_snapshots(target_dir)],
+        }
+
+    def _derive_split_output_dir(base_dir: Path, target_subset: str):
+        base_name = base_dir.name
+        lowered = base_name.lower()
+        for suffix in ("-train", "-test", "_train", "_test"):
+            if lowered.endswith(suffix):
+                root = base_name[: -len(suffix)]
+                if root:
+                    return base_dir.with_name(f"{root}-{target_subset}")
+        return base_dir.with_name(f"{base_name}-{target_subset}")
+
+    if split_manifest_path is not None:
+        split_manifest = load_split_manifest(split_manifest_path)
+        if subset_norm == "all":
+            generated = {}
+            for split_subset in ("train", "test"):
+                subset_files = subset_files_from_manifest(split_manifest, split_subset)
+                if not subset_files:
+                    raise ValueError(f"Split manifest contains no files for subset='{split_subset}'")
+
+                target_dir = _derive_split_output_dir(processed_dir, split_subset)
+                process_transient_data(raw_dir, target_dir, selected_filenames=subset_files)
+                target_summary = {
+                    "processed_dir": str(target_dir),
+                    "subset": split_subset,
+                    "selected_files": int(len(subset_files)),
+                    "snapshots": [p.name for p in _discover_snapshots(target_dir)],
+                }
+                _write_json(target_dir / "dataset_manifest.json", _build_dataset_manifest(target_dir, split_subset, subset_files))
+                generated[split_subset] = target_summary
+
+            return {
+                "processed_dir": str(processed_dir),
+                "split_manifest_path": str(Path(split_manifest_path)),
+                "subset": "all",
+                "split_mode": split_manifest.get("split_mode"),
+                "n_train": split_manifest.get("n_train"),
+                "n_test": split_manifest.get("n_test"),
+                "generated": generated,
+            }
+
+        selected_files = subset_files_from_manifest(split_manifest, subset_norm)
+        if subset_norm in {"train", "test"} and not selected_files:
+            raise ValueError(f"Split manifest contains no files for subset='{subset_norm}'")
+
+    process_transient_data(raw_dir, processed_dir, selected_filenames=selected_files)
+
+    summary = {
         "processed_dir": str(processed_dir),
         "snapshots": [p.name for p in _discover_snapshots(processed_dir)],
     }
+    if split_manifest is not None:
+        summary.update(
+            {
+                "split_manifest_path": str(Path(split_manifest_path)),
+                "subset": subset_norm,
+                "selected_files": int(len(selected_files)),
+                "split_mode": split_manifest.get("split_mode"),
+                "n_train": split_manifest.get("n_train"),
+                "n_test": split_manifest.get("n_test"),
+            }
+        )
+
+    _write_json(processed_dir / "dataset_manifest.json", _build_dataset_manifest(processed_dir, subset_norm, selected_files))
+
+    return summary
 
 
 def run_mode_training(processed_dir: Path, models_dir: Path, mode_name: str, mode_params: dict | None = None):
@@ -169,6 +320,16 @@ def run_mode_training(processed_dir: Path, models_dir: Path, mode_name: str, mod
             summary[variable]["dmd_rank_effective"] = int(getattr(mode_builder, "_rank_effective", 0) or 0)
             summary[variable]["dmd_dt"] = float(getattr(mode_builder, "_dt", 0.0) or 0.0)
             summary[variable]["dmd_t0"] = float(getattr(mode_builder, "_t0", 0.0) or 0.0)
+
+    mode_manifest = {
+        "updated_at": _now_iso(),
+        "mode_name": mode_name,
+        "processed_dir": str(processed_dir),
+        "mode_params": _to_jsonable(mode_params),
+        "variables": sorted(summary.keys()),
+        "variable_summary": _to_jsonable(summary),
+    }
+    _write_json(mode_root / "mode_manifest.json", mode_manifest)
 
     return summary
 
@@ -263,7 +424,169 @@ def run_offline_training(
 
     if not summary:
         raise RuntimeError(f"No offline models were trained from {mode_root}")
+
+    trainer_manifest = {
+        "updated_at": _now_iso(),
+        "trainer_name": trainer_name,
+        "mode_name": mode_name,
+        "input_column": input_column,
+        "trainer_params": _to_jsonable(trainer_params),
+        "eval_mode": eval_mode,
+        "val_ratio": float(val_ratio),
+        "min_train_samples": int(min_train_samples),
+        "variables": sorted(summary.keys()),
+        "variable_summary": _to_jsonable(summary),
+    }
+    _write_json(models_dir / trainer_name / mode_name / "trainer_manifest.json", trainer_manifest)
+
     return summary
+
+
+def run_test_evaluation(
+    processed_test_dir: Path,
+    models_dir: Path,
+    mode_name: str,
+    trainer_name: str,
+    output_dir: Path,
+    input_column: str = "time",
+):
+    processed_test_dir = Path(processed_test_dir)
+    models_dir = Path(models_dir)
+    output_dir = Path(output_dir)
+
+    doe_path = processed_test_dir / "doe.csv"
+    if not doe_path.exists():
+        raise FileNotFoundError(f"Missing DOE file for test set: {doe_path}")
+
+    doe = pd.read_csv(doe_path)
+    if input_column not in doe.columns:
+        raise ValueError(f"Column '{input_column}' is missing in {doe_path}")
+    time_values = doe[input_column].to_numpy(dtype=np.float64)
+
+    snapshots = {}
+    for snap_path in _discover_snapshots(processed_test_dir):
+        variable = snap_path.stem.replace("Snapshot_", "")
+        arr = np.asarray(np.load(snap_path), dtype=np.float64)
+        if arr.ndim != 2:
+            raise ValueError(f"Snapshot must be 2D for '{variable}', got {arr.shape}")
+
+        if arr.shape[1] != time_values.size:
+            if arr.shape[0] == time_values.size:
+                arr = arr.T
+            else:
+                raise ValueError(
+                    f"Snapshot/time mismatch for '{variable}': snapshot={arr.shape}, times={time_values.shape}"
+                )
+        snapshots[variable] = arr
+
+    if not snapshots:
+        raise RuntimeError(f"No Snapshot_*.npy files found in {processed_test_dir}")
+
+    runner = OnlinePredictionRunner(models_dir=models_dir, mode_name=mode_name, trainer_name=trainer_name)
+    rows = []
+
+    for t_idx, t in enumerate(time_values):
+        pred_df = runner.step(float(t))
+        for variable, y_true_full in snapshots.items():
+            field_column = _field_column_for_variable(variable)
+            if field_column not in pred_df.columns:
+                continue
+
+            y_true = np.asarray(y_true_full[:, t_idx], dtype=np.float64).reshape(-1, 1)
+            y_pred = np.asarray(pred_df[field_column].to_numpy(dtype=np.float64), dtype=np.float64).reshape(-1, 1)
+            if y_true.shape != y_pred.shape:
+                raise ValueError(
+                    f"Prediction node count mismatch for '{variable}' at index {t_idx}: "
+                    f"true={y_true.shape}, pred={y_pred.shape}"
+                )
+
+            metrics = _regression_metrics(y_true, y_pred)
+            r2 = metrics.get("r2")
+            rows.append(
+                {
+                    "time": float(t),
+                    "time_index": int(t_idx),
+                    "variable": variable,
+                    "field_column": field_column,
+                    "r2": r2,
+                    "r2_error": None if r2 is None else float(1.0 - float(r2)),
+                    "rmse": metrics.get("rmse"),
+                    "mae": metrics.get("mae"),
+                }
+            )
+
+    if not rows:
+        raise RuntimeError("No evaluation rows were created. Check variable/column mapping and model artifacts.")
+
+    eval_df = pd.DataFrame(rows)
+    summary_rows = []
+    for variable, group in eval_df.groupby("variable"):
+        valid_r2 = group["r2"].dropna()
+        summary_rows.append(
+            {
+                "variable": variable,
+                "samples": int(group.shape[0]),
+                "r2_mean": None if valid_r2.empty else float(valid_r2.mean()),
+                "r2_min": None if valid_r2.empty else float(valid_r2.min()),
+                "r2_max": None if valid_r2.empty else float(valid_r2.max()),
+                "rmse_mean": float(group["rmse"].mean()),
+                "mae_mean": float(group["mae"].mean()),
+            }
+        )
+    summary_df = pd.DataFrame(summary_rows).sort_values("variable")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    r2_by_time_path = output_dir / "r2_by_time.csv"
+    r2_summary_path = output_dir / "r2_summary.csv"
+    plot_path = output_dir / "r2_plot.png"
+    eval_df.to_csv(r2_by_time_path, index=False)
+    summary_df.to_csv(r2_summary_path, index=False)
+
+    plot_error = None
+    try:
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+        ax_r2, ax_err = axes
+
+        for variable in sorted(eval_df["variable"].unique()):
+            var_df = eval_df[eval_df["variable"] == variable].sort_values("time")
+            ax_r2.plot(var_df["time"], var_df["r2"], label=variable)
+            ax_err.plot(var_df["time"], var_df["r2_error"], label=variable)
+
+        ax_r2.set_title("R2 on Test Set")
+        ax_r2.set_ylabel("R2")
+        ax_r2.grid(True, alpha=0.3)
+        ax_r2.legend(loc="best")
+
+        ax_err.set_title("R2 Error (1 - R2) on Test Set")
+        ax_err.set_xlabel(input_column)
+        ax_err.set_ylabel("1 - R2")
+        ax_err.grid(True, alpha=0.3)
+
+        fig.tight_layout()
+        fig.savefig(plot_path, dpi=150)
+        plt.close(fig)
+    except Exception as exc:  # noqa: BLE001
+        plot_error = str(exc)
+
+    report = {
+        "updated_at": _now_iso(),
+        "processed_test_dir": str(processed_test_dir),
+        "models_dir": str(models_dir),
+        "mode_name": mode_name,
+        "trainer_name": trainer_name,
+        "input_column": input_column,
+        "n_times": int(time_values.size),
+        "n_variables": int(summary_df.shape[0]),
+        "r2_by_time_path": str(r2_by_time_path),
+        "r2_summary_path": str(r2_summary_path),
+        "r2_plot_path": str(plot_path),
+        "plot_error": plot_error,
+        "variable_summary": _to_jsonable(summary_rows),
+    }
+    _write_json(output_dir / "evaluation_manifest.json", report)
+    return report
 
 
 def run_online_prediction(

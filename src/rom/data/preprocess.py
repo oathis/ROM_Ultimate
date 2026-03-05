@@ -6,13 +6,15 @@ import re
 import struct
 import shutil
 
-def process_transient_data(data_dir: Path, output_dir: Path):
+
+def process_transient_data(data_dir: Path, output_dir: Path, selected_filenames=None):
     """
     Reads CSV files from data_dir, extracts data, and saves to output_dir.
     
     Args:
         data_dir: Path to the directory containing xresults-*.csv files (e.g., data/raw/Dataset)
         output_dir: Path to save the processed files (e.g., data/processed)
+        selected_filenames: Optional list of raw csv filenames to process.
     """
     data_dir = Path(data_dir)
     output_dir = Path(output_dir)
@@ -21,6 +23,18 @@ def process_transient_data(data_dir: Path, output_dir: Path):
     print(f"Searching for CSV files in {data_dir}...")
     # Find all CSV files matching the pattern
     csv_files = list(data_dir.glob("xresult-*.csv"))
+    if selected_filenames is not None:
+        selected_names = [Path(name).name for name in selected_filenames]
+        selected_set = set(selected_names)
+        csv_map = {path.name: path for path in csv_files}
+        missing = sorted(selected_set - set(csv_map.keys()))
+        if missing:
+            missing_preview = ", ".join(missing[:5])
+            raise FileNotFoundError(
+                f"{len(missing)} files from selected_filenames were not found in {data_dir}. "
+                f"Examples: {missing_preview}"
+            )
+        csv_files = [csv_map[name] for name in selected_names if name in csv_map]
     
     if not csv_files:
         print(f"No files found matching pattern 'xresult-*.csv' in {data_dir}")

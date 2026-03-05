@@ -23,6 +23,8 @@ artifacts/scalers/*
 !artifacts/scalers/.gitkeep
 artifacts/sessions/*
 !artifacts/sessions/.gitkeep
+artifacts/splits/*
+!artifacts/splits/.gitkeep
 
 # Generated media/debug outputs
 *.gif

@@ -45,9 +45,9 @@ def main():
     parser.add_argument("--ridge", type=float, default=1e-8, help="Projection ridge regularization")
     parser.add_argument(
         "--eval-mode",
-        default="both",
+        default="none",
         choices=["none", "interpolation", "extrapolation", "both"],
-        help="Validation profile for offline trainer diagnostics",
+        help="Optional validation profile for legacy offline diagnostics",
     )
     parser.add_argument("--val-ratio", type=float, default=0.2, help="Validation ratio used for split profiles")
     parser.add_argument("--min-train-samples", type=int, default=8, help="Minimum samples kept for train split")
