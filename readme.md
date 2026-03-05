@@ -1,263 +1,172 @@
-# ROM Ultimate: Offline/Online 모드 선택형 실행 아키텍처 제안
+# ROM Ultimate
 
-데이터가 주어졌을 때,
-1) 모드 구성 방식(POD 등) 선택,
-2) Offline 학습 방식(RBF / NN / Projection-based) 선택,
-3) Online 실행,
-을 일관되게 연결하기 위한 **확장 가능한 코드 구조** 예시입니다.
+ROM Ultimate is a session-based ROM workflow app for:
 
----
+1. preprocessing CFD-like transient CSV snapshots
+2. mode decomposition (`pod`, `dmd`)
+3. offline surrogate training (`rbf`, `nn`, `projection`)
+4. online prediction and test evaluation
+5. interactive 3D visualization
 
-## 1. 핵심 설계 원칙
+## Key Concepts
 
-- **전략 분리(Strategy Pattern)**: `mode_builder`, `offline_trainer`, `online_runner`를 인터페이스로 분리.
-- **실험 재현성**: 모든 설정은 `configs/*.yaml`로 관리.
-- **파이프라인 일원화**: `run_pipeline.py` 하나에서 `build -> train -> deploy -> infer` 실행.
-- **플러그인 확장**: 새 기법 추가 시 기존 코드 최소 수정(등록만 추가).
+- `mode` is for reduced-order basis generation (`pod`, `dmd`)
+- `trainer` is for offline surrogate fitting on latent dynamics (`rbf`, `nn`, `projection`)
+- each browser session is isolated under `artifacts/sessions/<session-id>/...`
 
----
+## Current Data Flow
 
-## 2. 추천 디렉토리 구조
+1. Split raw file list into train/test indices (`split_manifest.json`)
+2. Preprocess raw CSV to processed snapshots
+3. Train mode artifacts from train processed data
+4. Train offline model from train processed data + mode artifacts
+5. Evaluate on test processed data (`R2`, `1-R2`, CSV/plot outputs)
+
+## Preprocess Behavior (Important)
+
+In the web app Preprocess tab:
+
+- `split-policy=apply`:
+  - split manifest is used
+  - train and test are generated together automatically
+  - output directories become:
+    - `<base>-train`
+    - `<base>-test`
+- `split-policy=none`:
+  - no split is used
+  - one processed dataset is generated
+
+This removes manual train/test picking for the normal path.
+
+## Artifact Layout (Session Workspace)
+
+Within one session:
 
 ```text
-rom_ultimate/
-├─ pyproject.toml
-├─ readme.md
-├─ configs/
-│  ├─ dataset/
-│  │  └─ default.yaml
-│  ├─ mode/
-│  │  ├─ pod.yaml
-│  │  └─ dmd.yaml
-│  ├─ offline/
-│  │  ├─ rbf.yaml
-│  │  ├─ nn.yaml
-│  │  └─ projection.yaml
-│  └─ experiment/
-│     └─ baseline.yaml
-├─ data/
-│  ├─ raw/
-│  ├─ processed/
-│  └─ splits/
-├─ artifacts/
-│  ├─ modes/
-│  ├─ models/
-│  ├─ scalers/
-│  └─ reports/
-├─ src/
-│  └─ rom/
-│     ├─ __init__.py
-│     ├─ interfaces/
-│     │  ├─ mode_builder.py
-│     │  ├─ offline_trainer.py
-│     │  └─ online_runner.py
-│     ├─ registry/
-│     │  ├─ mode_registry.py
-│     │  ├─ trainer_registry.py
-│     │  └─ runner_registry.py
-│     ├─ modes/
-│     │  ├─ pod_builder.py
-│     │  └─ dmd_builder.py
-│     ├─ trainers/
-│     │  ├─ rbf_trainer.py
-│     │  ├─ nn_trainer.py
-│     │  └─ projection_trainer.py
-│     ├─ runners/
-│     │  ├─ static_runner.py
-│     │  └─ streaming_runner.py
-│     ├─ data/
-│     │  ├─ dataset.py
-│     │  ├─ preprocess.py
-│     │  └─ split.py
-│     ├─ core/
-│     │  ├─ config.py
-│     │  ├─ pipeline.py
-│     │  ├─ io.py
-│     │  └─ metrics.py
-│     └─ cli/
-│        ├─ run_pipeline.py
-│        ├─ train_offline.py
-│        └─ run_online.py
-└─ tests/
-   ├─ test_registry.py
-   ├─ test_pipeline_smoke.py
-   └─ test_online_runner.py
+artifacts/sessions/<session-id>/
+  workspace/
+    data/
+      processed/
+        catalog/
+          dataset-train/
+          dataset-test/
+    models/
+      catalog/
+        <mode-profile-name>/
+          pod/...
+          dmd/...
+          rbf/<mode>/...
+          nn/<mode>/...
+    predictions/
+      eval/...
 ```
 
----
+`mode` artifacts and `trainer` artifacts are separated by namespace under the selected model profile directory.
 
-## 3. 각 계층의 책임
+## Evaluate Tab Philosophy
 
-### A. Mode Builder (`modes/*`)
-- 입력: 고차원 스냅샷/시계열 데이터
-- 출력: reduced basis(모드 행렬), 모드 메타데이터
-- 예: POD면 SVD 기반으로 rank/truncation 정책 적용
+Evaluate should answer one task:
 
-### B. Offline Trainer (`trainers/*`)
-- 입력: 모드 좌표(latent coefficient), 조건 변수(파라미터)
-- 출력: 매핑 모델(예: `u -> a` 혹은 `param -> latent`)
-- 선택지:
-  - **RBF**: 작은~중간 데이터, 빠른 구축
-  - **NN**: 비선형 복잡도 높고 데이터 많은 경우
-  - **Projection-based**: 물리/연산 구조를 보존하고 싶을 때
+`evaluate selected ROM profile on selected test dataset`
 
-### C. Online Runner (`runners/*`)
-- 입력: 온라인 입력(새 파라미터/초기조건/센서)
-- 동작: offline 산출물 로드 → 추론/시간적 업데이트
-- 출력: 재구성된 상태, latency/오차 로그
+The tab is designed to:
 
----
+- select one ROM profile (registered or direct)
+- auto-resolve `models-dir`, `mode`, and `trainer`
+- auto-suggest test dataset path
+- run test evaluation
+- show curves and 3D GT vs Prediction comparison
 
-## 4. 인터페이스 예시 (최소 스켈레톤)
+## Quick Start (CLI)
 
-```python
-# src/rom/interfaces/mode_builder.py
-from abc import ABC, abstractmethod
+### 0) Optional: create split manifest
 
-class ModeBuilder(ABC):
-    @abstractmethod
-    def fit(self, snapshots):
-        ...
-
-    @abstractmethod
-    def transform(self, snapshots):
-        ...
-
-    @abstractmethod
-    def save(self, path):
-        ...
+```bash
+python scripts/run_dataset_split.py ^
+  --raw-dir "examples/sample_raw/mini_case" ^
+  --output-path "artifacts/splits/mini_case_split.json" ^
+  --mode extrapolation ^
+  --test-ratio 0.25 ^
+  --min-train-samples 4
 ```
 
-```python
-# src/rom/interfaces/offline_trainer.py
-from abc import ABC, abstractmethod
+### 1) Preprocess with split (auto creates train/test together)
 
-class OfflineTrainer(ABC):
-    @abstractmethod
-    def fit(self, x_train, y_train):
-        ...
-
-    @abstractmethod
-    def predict(self, x):
-        ...
-
-    @abstractmethod
-    def save(self, path):
-        ...
+```bash
+python scripts/run_preprocess.py ^
+  --raw-dir "examples/sample_raw/mini_case" ^
+  --processed-dir "artifacts/tmp/mini_case/dataset" ^
+  --split-manifest "artifacts/splits/mini_case_split.json" ^
+  --subset all
 ```
 
-```python
-# src/rom/interfaces/online_runner.py
-from abc import ABC, abstractmethod
+Outputs:
 
-class OnlineRunner(ABC):
-    @abstractmethod
-    def load_artifacts(self, mode_path, model_path):
-        ...
+- `artifacts/tmp/mini_case/dataset-train`
+- `artifacts/tmp/mini_case/dataset-test`
 
-    @abstractmethod
-    def step(self, online_input):
-        ...
+### 2) Mode training on train set
+
+```bash
+python scripts/run_mode_training.py ^
+  --processed-dir "artifacts/tmp/mini_case/dataset-train" ^
+  --models-dir "artifacts/tmp/mini_case/models" ^
+  --mode pod ^
+  --rank 8
 ```
 
----
+### 3) Offline training on train set
 
-## 5. Registry 기반 선택 로직
-
-설정 파일에서 문자열만 바꾸면 구현체가 선택되도록 만듭니다.
-
-```python
-# src/rom/registry/mode_registry.py
-REGISTRY = {
-    "pod": "rom.modes.pod_builder:PODBuilder",
-    "dmd": "rom.modes.dmd_builder:DMDBuilder",
-}
+```bash
+python scripts/run_offline_training.py ^
+  --processed-dir "artifacts/tmp/mini_case/dataset-train" ^
+  --models-dir "artifacts/tmp/mini_case/models" ^
+  --mode pod ^
+  --trainer rbf ^
+  --input-column time ^
+  --kernel cubic ^
+  --epsilon 1.0
 ```
 
-`trainer_registry.py`도 동일하게:
-- `rbf` -> `RBFTrainer`
-- `nn` -> `NNTrainer`
-- `projection` -> `ProjectionTrainer`
+### 4) Evaluate on test set
 
-이 구조를 쓰면, 새 기법 추가 시:
-1) 구현 파일 추가,
-2) 레지스트리 1줄 등록,
-3) config 이름만 변경
-으로 끝납니다.
-
----
-
-## 6. 파이프라인 오케스트레이션
-
-```python
-# src/rom/core/pipeline.py (개념)
-def run_pipeline(cfg):
-    # 1) 데이터 로드/전처리
-    data = load_dataset(cfg.dataset)
-
-    # 2) 모드 생성
-    mode_builder = build_mode(cfg.mode.name, cfg.mode)
-    mode_builder.fit(data.snapshots)
-    latent = mode_builder.transform(data.snapshots)
-
-    # 3) offline 학습
-    trainer = build_trainer(cfg.offline.name, cfg.offline)
-    trainer.fit(data.params, latent)
-
-    # 4) 산출물 저장
-    mode_builder.save(cfg.paths.mode_artifact)
-    trainer.save(cfg.paths.model_artifact)
-
-    # 5) 평가/리포트
-    evaluate_and_report(...)
+```bash
+python scripts/run_test_evaluation.py ^
+  --processed-test-dir "artifacts/tmp/mini_case/dataset-test" ^
+  --models-dir "artifacts/tmp/mini_case/models" ^
+  --output-dir "artifacts/tmp/mini_case/eval" ^
+  --mode pod ^
+  --trainer rbf ^
+  --input-column time
 ```
 
----
+## Web App
 
-## 7. 설정 파일 예시
+Run:
 
-```yaml
-# configs/experiment/baseline.yaml
-dataset:
-  name: default
-mode:
-  name: pod
-  rank: 32
-offline:
-  name: rbf
-  kernel: gaussian
-online:
-  runner: static
-paths:
-  mode_artifact: artifacts/modes/pod_rank32.pkl
-  model_artifact: artifacts/models/rbf_gaussian.pkl
+```bash
+python -m streamlit run scripts/run_web_app.py
 ```
 
-핵심은 `mode.name`, `offline.name`, `online.runner` 세 값만 바꿔 실험 축을 구성하는 것입니다.
+Recommended order in UI:
 
----
+1. Split tab: build split manifest
+2. Preprocess tab: `split-policy=apply`
+3. Mode tab: train mode profile from `dataset-train`
+4. Offline tab: train trainer using the same profile + train dataset
+5. Evaluate tab: select ROM profile and test dataset, run evaluation
+6. Viewer tab: inspect 3D prediction playback
 
-## 8. 추천 개발 순서
+## Example Data Included
 
-1. `interfaces/*` 먼저 정의
-2. `PODBuilder + RBFTrainer + StaticRunner` 최소 조합 구현
-3. `pipeline.py` 연결 후 smoke test 작성
-4. `NNTrainer` 추가
-5. `ProjectionTrainer` 추가
-6. 실험 로그/메트릭 비교 자동화
+Small runnable raw sample files are included here:
 
----
+- `examples/sample_raw/mini_case/xresult-*.csv`
 
-## 9. 실무 팁
+They are intentionally tiny to validate end-to-end flow quickly.
 
-- **아티팩트 버전 관리**: 파일명에 데이터 버전/하이퍼파라미터 포함.
-- **수치 안정성**: POD truncation 기준(에너지 누적률 등)을 config에 명시.
-- **평가 분리**: offline 정확도와 online 안정성(rollout error) 별도 추적.
-- **실시간 요구 대응**: OnlineRunner는 모델 로드 비용 최소화(초기 1회 로드).
+## Notes
 
----
-
-## 10. 한 줄 결론
-
-`ModeBuilder / OfflineTrainer / OnlineRunner`를 독립 인터페이스 + registry + config 기반으로 설계하면,
-POD/RBF에서 시작해 NN/Projection 방식으로 자연스럽게 확장 가능한 ROM 파이프라인을 만들 수 있습니다.
+- `1 - R2` is dimensionless (not percent).
+- Very large `1 - R2` means poor generalization (often severe extrapolation or wrong path pairing).
+- Large runtime artifacts are ignored by git; code and small examples are versioned.
