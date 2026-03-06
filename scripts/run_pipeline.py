@@ -9,6 +9,9 @@ from rom.registry.runner_registry import REGISTRY as RUNNER_REGISTRY
 from rom.registry.trainer_registry import REGISTRY as TRAINER_REGISTRY
 
 
+NO_TRAINER_NAME = "none"
+
+
 def _parse_hidden_dims(raw: str):
     text = (raw or "").strip()
     if not text:
@@ -17,13 +20,19 @@ def _parse_hidden_dims(raw: str):
 
 
 def main():
+    trainer_choices = sorted(TRAINER_REGISTRY.keys()) + [NO_TRAINER_NAME]
     parser = argparse.ArgumentParser(description="Run full ROM pipeline: preprocess -> mode -> offline -> online.")
     parser.add_argument("--raw-dir", default=str(ROOT_DIR / "data/raw/Dataset"), help="Raw CSV directory")
     parser.add_argument("--processed-dir", default=str(ROOT_DIR / "data/processed"), help="Processed output directory")
     parser.add_argument("--models-dir", default=str(ROOT_DIR / "models"), help="Root model directory")
     parser.add_argument("--predictions-dir", default=str(ROOT_DIR / "predictions"), help="Prediction output directory")
     parser.add_argument("--mode", default="pod", choices=sorted(MODE_REGISTRY.keys()), help="Mode builder name")
-    parser.add_argument("--trainer", default="rbf", choices=sorted(TRAINER_REGISTRY.keys()), help="Offline trainer name")
+    parser.add_argument(
+        "--trainer",
+        default="rbf",
+        choices=trainer_choices,
+        help="Offline trainer name. Use 'none' when running DMD direct reconstruction.",
+    )
     parser.add_argument("--runner", default="reconstruction", choices=sorted(RUNNER_REGISTRY.keys()), help="Online runner name")
     parser.add_argument("--rank", type=int, default=32, help="Target rank/modes")
     parser.add_argument("--auto-rank", action="store_true", help="Use mode default rank behavior (pass rank=None)")

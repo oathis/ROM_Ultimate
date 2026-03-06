@@ -16,6 +16,9 @@ from rom.data.split import (
 from rom.runners.online_prediction import OnlinePredictionRunner
 
 
+NO_TRAINER_NAME = "none"
+
+
 def _discover_snapshots(processed_dir: Path):
     return sorted(processed_dir.glob("Snapshot_*.npy"))
 
@@ -46,6 +49,14 @@ def _to_jsonable(value):
 def _write_json(path: Path, payload: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _mode_uses_offline_trainer(mode_name: str):
+    return str(mode_name or "").strip().lower() != "dmd"
+
+
+def _is_none_trainer_name(trainer_name: str):
+    return str(trainer_name or "").strip().lower() in {"", NO_TRAINER_NAME}
 
 
 def _resolve_eval_modes(eval_mode: str):
@@ -363,6 +374,29 @@ def run_offline_training(
     if not mode_root.exists():
         raise FileNotFoundError(f"Mode artifact directory not found: {mode_root}")
 
+    if not _mode_uses_offline_trainer(mode_name):
+        if _is_none_trainer_name(trainer_name):
+            summary = {}
+            for var_dir in sorted([d for d in mode_root.iterdir() if d.is_dir()]):
+                latent_path = var_dir / "latent.npy"
+                if not latent_path.exists():
+                    continue
+                latent_shape = tuple(np.load(latent_path, mmap_mode="r").shape)
+                summary[var_dir.name] = {
+                    "input_shape": tuple(x_train.shape),
+                    "target_shape": latent_shape,
+                    "model_path": None,
+                    "model_namespace": None,
+                    "validation": {},
+                    "skipped": True,
+                    "reason": "dmd_direct_reconstruction",
+                }
+            if not summary:
+                raise RuntimeError(f"No DMD latent artifacts found under {mode_root}")
+            return summary
+    elif _is_none_trainer_name(trainer_name):
+        raise ValueError("trainer='none' is only valid when mode='dmd'.")
+
     summary = {}
     for var_dir in sorted([d for d in mode_root.iterdir() if d.is_dir()]):
         latent_path = var_dir / "latent.npy"
@@ -502,6 +536,13 @@ def run_test_evaluation(
 
             metrics = _regression_metrics(y_true, y_pred)
             r2 = metrics.get("r2")
+            l2_error = float(np.linalg.norm(y_pred - y_true, ord=2))
+            l2_true_norm = float(np.linalg.norm(y_true, ord=2))
+            if l2_true_norm <= 1e-12:
+                # Degenerate baseline: if truth is effectively zero, report 0% only when prediction matches.
+                l2_error_pct = 0.0 if l2_error <= 1e-12 else float("nan")
+            else:
+                l2_error_pct = float((l2_error / l2_true_norm) * 100.0)
             rows.append(
                 {
                     "time": float(t),
@@ -509,7 +550,8 @@ def run_test_evaluation(
                     "variable": variable,
                     "field_column": field_column,
                     "r2": r2,
-                    "r2_error": None if r2 is None else float(1.0 - float(r2)),
+                    "l2_error": l2_error,
+                    "l2_error_pct": l2_error_pct,
                     "rmse": metrics.get("rmse"),
                     "mae": metrics.get("mae"),
                 }
@@ -529,6 +571,9 @@ def run_test_evaluation(
                 "r2_mean": None if valid_r2.empty else float(valid_r2.mean()),
                 "r2_min": None if valid_r2.empty else float(valid_r2.min()),
                 "r2_max": None if valid_r2.empty else float(valid_r2.max()),
+                "l2_mean": float(group["l2_error"].mean()),
+                "l2_min": float(group["l2_error"].min()),
+                "l2_max": float(group["l2_error"].max()),
                 "rmse_mean": float(group["rmse"].mean()),
                 "mae_mean": float(group["mae"].mean()),
             }
@@ -536,11 +581,11 @@ def run_test_evaluation(
     summary_df = pd.DataFrame(summary_rows).sort_values("variable")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    r2_by_time_path = output_dir / "r2_by_time.csv"
-    r2_summary_path = output_dir / "r2_summary.csv"
-    plot_path = output_dir / "r2_plot.png"
-    eval_df.to_csv(r2_by_time_path, index=False)
-    summary_df.to_csv(r2_summary_path, index=False)
+    evaluation_by_time_path = output_dir / "evaluation_by_time.csv"
+    evaluation_summary_path = output_dir / "evaluation_summary.csv"
+    plot_path = output_dir / "evaluation_plot.png"
+    eval_df.to_csv(evaluation_by_time_path, index=False)
+    summary_df.to_csv(evaluation_summary_path, index=False)
 
     plot_error = None
     try:
@@ -552,16 +597,19 @@ def run_test_evaluation(
         for variable in sorted(eval_df["variable"].unique()):
             var_df = eval_df[eval_df["variable"] == variable].sort_values("time")
             ax_r2.plot(var_df["time"], var_df["r2"], label=variable)
-            ax_err.plot(var_df["time"], var_df["r2_error"], label=variable)
+            if "l2_error_pct" in var_df.columns:
+                ax_err.plot(var_df["time"], var_df["l2_error_pct"], label=variable)
+            else:
+                ax_err.plot(var_df["time"], var_df["l2_error"], label=variable)
 
         ax_r2.set_title("R2 on Test Set")
         ax_r2.set_ylabel("R2")
         ax_r2.grid(True, alpha=0.3)
         ax_r2.legend(loc="best")
 
-        ax_err.set_title("R2 Error (1 - R2) on Test Set")
+        ax_err.set_title("L2 Error on Test Set")
         ax_err.set_xlabel(input_column)
-        ax_err.set_ylabel("1 - R2")
+        ax_err.set_ylabel("L2 norm (%)")
         ax_err.grid(True, alpha=0.3)
 
         fig.tight_layout()
@@ -579,8 +627,12 @@ def run_test_evaluation(
         "input_column": input_column,
         "n_times": int(time_values.size),
         "n_variables": int(summary_df.shape[0]),
-        "r2_by_time_path": str(r2_by_time_path),
-        "r2_summary_path": str(r2_summary_path),
+        "evaluation_by_time_path": str(evaluation_by_time_path),
+        "evaluation_summary_path": str(evaluation_summary_path),
+        "evaluation_plot_path": str(plot_path),
+        # Backward-compatible aliases for older UI readers.
+        "r2_by_time_path": str(evaluation_by_time_path),
+        "r2_summary_path": str(evaluation_summary_path),
         "r2_plot_path": str(plot_path),
         "plot_error": plot_error,
         "variable_summary": _to_jsonable(summary_rows),

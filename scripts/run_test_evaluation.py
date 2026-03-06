@@ -8,9 +8,13 @@ from rom.registry.mode_registry import REGISTRY as MODE_REGISTRY
 from rom.registry.trainer_registry import REGISTRY as TRAINER_REGISTRY
 
 
+NO_TRAINER_NAME = "none"
+
+
 def main():
+    trainer_choices = sorted(TRAINER_REGISTRY.keys()) + [NO_TRAINER_NAME]
     parser = argparse.ArgumentParser(
-        description="Evaluate trained ROM on processed test set and export R2 diagnostics."
+        description="Evaluate trained ROM on processed test set and export evaluation diagnostics (R2 + L2)."
     )
     parser.add_argument(
         "--processed-test-dir",
@@ -27,8 +31,8 @@ def main():
     parser.add_argument(
         "--trainer",
         default="rbf",
-        choices=sorted(TRAINER_REGISTRY.keys()),
-        help="Trainer namespace (used for POD reconstruction)",
+        choices=trainer_choices,
+        help="Trainer namespace (used for POD reconstruction). Use 'none' for DMD direct reconstruction mode.",
     )
     parser.add_argument("--input-column", default="time", help="Time/input column in test doe.csv")
     args = parser.parse_args()
@@ -43,9 +47,9 @@ def main():
     )
 
     print("Test evaluation completed.")
-    print(f"R2 by time: {summary['r2_by_time_path']}")
-    print(f"R2 summary: {summary['r2_summary_path']}")
-    print(f"R2 plot: {summary['r2_plot_path']}")
+    print(f"Evaluation by time: {summary['evaluation_by_time_path']}")
+    print(f"Evaluation summary: {summary['evaluation_summary_path']}")
+    print(f"Evaluation plot: {summary['evaluation_plot_path']}")
     if summary.get("plot_error"):
         print(f"Plot warning: {summary['plot_error']}")
 

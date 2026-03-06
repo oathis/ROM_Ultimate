@@ -58,7 +58,7 @@ Optional dependency for native desktop viewer:
 1. Create split manifest from raw data.
 2. Preprocess with `--subset all` to generate `-train` and `-test` directories in one run.
 3. Train mode + offline model from train processed data.
-4. Run `run_test_evaluation.py` on the test processed directory to export `r2_by_time.csv`, `r2_summary.csv`, `r2_plot.png`.
+4. Run `run_test_evaluation.py` on the test processed directory to export `evaluation_by_time.csv`, `evaluation_summary.csv`, `evaluation_plot.png` (`r2` and `l2_error` per time/variable).
 
 ### Split mode details
 

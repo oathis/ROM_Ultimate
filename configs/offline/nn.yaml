@@ -1,4 +1,4 @@
 name: nn
 hidden_dims: [128, 128]
-activation: relu
-epochs: 200
+activation: tanh
+epochs: 600

@@ -61,12 +61,13 @@ RBF_KERNEL_OPTIONS = [
     "multiquadric",
 ]
 
-NN_ACTIVATION_OPTIONS = ["relu", "tanh", "gelu", "sigmoid", "linear"]
+NN_ACTIVATION_OPTIONS = ["tanh", "relu", "gelu", "sigmoid", "linear"]
 VISUAL_VARIABLES = ["velocity", "T", "u", "v", "w"]
 OFFLINE_EVAL_OPTIONS = ["none", "interpolation", "extrapolation", "both"]
 SPLIT_MODE_OPTIONS = ["interpolation", "extrapolation"]
 PROCESSED_CATALOG_DIRNAME = "catalog"
 MODEL_PROFILE_DIRNAME = "catalog"
+NO_TRAINER_NAME = "none"
 
 MODE_DESCRIPTIONS = {
     "pod": "POD reduced-basis builder. Control dimensionality with `rank`/`energy_threshold`.",
@@ -75,8 +76,9 @@ MODE_DESCRIPTIONS = {
 
 TRAINER_DESCRIPTIONS = {
     "rbf": "RBF interpolation surrogate. Good baseline for small to medium datasets.",
-    "nn": "Lightweight NN-like surrogate placeholder (currently linear baseline).",
+    "nn": "MLP surrogate for latent time dynamics (nonlinear regression).",
     "projection": "Projection-style surrogate with ridge stabilization.",
+    NO_TRAINER_NAME: "No offline trainer. DMD reconstructs directly from modal dynamics.",
 }
 
 FIELD_HELP = {
@@ -85,7 +87,7 @@ FIELD_HELP = {
     "predictions_dir": "Directory for online prediction outputs (csv/json).",
     "raw_dir": "Directory containing raw `xresult-*.csv` files.",
     "mode": "Mode builder algorithm (registry key).",
-    "trainer": "Offline trainer algorithm (registry key).",
+    "trainer": "Offline trainer algorithm (registry key). Use `none` for DMD direct reconstruction.",
     "runner": "Online runtime strategy (registry key).",
     "input_column": "Column name in `doe.csv` used as training input.",
     "eval_mode": "Validation profile: interpolation, extrapolation, both, or none.",
@@ -293,6 +295,25 @@ def _launch_native_viewer(command: list[str]):
     }
 
 
+def _trainer_ui_options():
+    # `none` is valid for DMD direct reconstruction.
+    return sorted(TRAINER_REGISTRY.keys()) + [NO_TRAINER_NAME]
+
+
+def _mode_uses_offline_trainer(mode_name: str):
+    return str(mode_name or "").strip().lower() != "dmd"
+
+
+def _is_none_trainer_name(trainer_name: str):
+    return str(trainer_name or "").strip().lower() in {"", NO_TRAINER_NAME}
+
+
+def _default_trainer_name(mode_name: str):
+    if not _mode_uses_offline_trainer(mode_name):
+        return NO_TRAINER_NAME
+    return "rbf" if "rbf" in TRAINER_REGISTRY else sorted(TRAINER_REGISTRY.keys())[0]
+
+
 def _parse_hidden_dims(raw: str):
     text = (raw or "").strip()
     if not text:
@@ -446,6 +467,8 @@ def _discover_mode_profile_catalog(profile_root_text: str):
 
             mode_manifest = _safe_read_json(mode_root / "mode_manifest.json") or {}
             trainer_availability = {}
+            if str(mode_name).strip().lower() == "dmd":
+                trainer_availability[NO_TRAINER_NAME] = list(variables)
             for trainer_name in trainer_options:
                 trainer_root = profile_dir / trainer_name / mode_name
                 if not trainer_root.exists():
@@ -494,51 +517,352 @@ def _discover_rom_profiles(models_dir_text: str):
 
     mode_options = sorted(MODE_REGISTRY.keys())
     trainer_options = sorted(TRAINER_REGISTRY.keys())
+
+    def _collect_from_root(root_dir: Path):
+        out = []
+        for mode_name in mode_options:
+            mode_root = root_dir / mode_name
+            if not mode_root.exists():
+                continue
+
+            mode_vars = sorted([d.name for d in mode_root.iterdir() if d.is_dir()])
+            if not mode_vars:
+                continue
+            mode_var_set = set(mode_vars)
+            mode_manifest = _safe_read_json(mode_root / "mode_manifest.json")
+
+            if str(mode_name).strip().lower() == "dmd":
+                try:
+                    updated_ts = mode_root.stat().st_mtime
+                except OSError:
+                    updated_ts = 0.0
+                out.append(
+                    {
+                        "mode_name": mode_name,
+                        "trainer_name": NO_TRAINER_NAME,
+                        "variables": list(mode_vars),
+                        "updated_ts": float(updated_ts),
+                        "mode_manifest": mode_manifest,
+                        "trainer_manifest": {},
+                    }
+                )
+
+            for trainer_name in trainer_options:
+                trainer_root = root_dir / trainer_name / mode_name
+                if not trainer_root.exists():
+                    continue
+
+                trainer_vars = []
+                for var in mode_vars:
+                    model_path = trainer_root / var / f"{trainer_name}_model.pkl"
+                    if model_path.exists():
+                        trainer_vars.append(var)
+                common_vars = sorted(set(trainer_vars) & mode_var_set)
+                if not common_vars:
+                    continue
+
+                trainer_manifest = _safe_read_json(trainer_root / "trainer_manifest.json")
+                try:
+                    updated_ts = trainer_root.stat().st_mtime
+                except OSError:
+                    updated_ts = 0.0
+
+                out.append(
+                    {
+                        "mode_name": mode_name,
+                        "trainer_name": trainer_name,
+                        "variables": common_vars,
+                        "updated_ts": float(updated_ts),
+                        "mode_manifest": mode_manifest,
+                        "trainer_manifest": trainer_manifest,
+                    }
+                )
+        return out
+
+    candidate_roots = []
+    seen_roots = set()
+
+    def _add_root(path_obj: Path):
+        if not _is_models_root_candidate(path_obj):
+            return
+        try:
+            key = str(path_obj.resolve())
+        except OSError:
+            key = str(path_obj)
+        if key in seen_roots:
+            return
+        seen_roots.add(key)
+        candidate_roots.append(path_obj)
+
+    _add_root(models_dir)
+    try:
+        for child in models_dir.iterdir():
+            if child.is_dir():
+                _add_root(child)
+    except OSError:
+        pass
+    catalog_root = models_dir / MODEL_PROFILE_DIRNAME
+    if catalog_root.exists() and catalog_root.is_dir():
+        try:
+            for child in catalog_root.iterdir():
+                if child.is_dir():
+                    _add_root(child)
+        except OSError:
+            pass
+
     profiles = []
-
-    for mode_name in mode_options:
-        mode_root = models_dir / mode_name
-        if not mode_root.exists():
-            continue
-
-        mode_vars = sorted([d.name for d in mode_root.iterdir() if d.is_dir()])
-        if not mode_vars:
-            continue
-        mode_var_set = set(mode_vars)
-        mode_manifest = _safe_read_json(mode_root / "mode_manifest.json")
-
-        for trainer_name in trainer_options:
-            trainer_root = models_dir / trainer_name / mode_name
-            if not trainer_root.exists():
-                continue
-
-            trainer_vars = []
-            for var in mode_vars:
-                model_path = trainer_root / var / f"{trainer_name}_model.pkl"
-                if model_path.exists():
-                    trainer_vars.append(var)
-            common_vars = sorted(set(trainer_vars) & mode_var_set)
-            if not common_vars:
-                continue
-
-            trainer_manifest = _safe_read_json(trainer_root / "trainer_manifest.json")
-            try:
-                updated_ts = trainer_root.stat().st_mtime
-            except OSError:
-                updated_ts = 0.0
-
-            profile = {
-                "mode_name": mode_name,
-                "trainer_name": trainer_name,
-                "variables": common_vars,
-                "updated_ts": float(updated_ts),
-                "mode_manifest": mode_manifest,
-                "trainer_manifest": trainer_manifest,
-            }
-            profiles.append(profile)
+    for root_dir in candidate_roots:
+        profiles.extend(_collect_from_root(root_dir))
 
     profiles.sort(key=lambda item: item.get("updated_ts", 0.0), reverse=True)
     return profiles
+
+
+def _is_models_root_candidate(path_obj: Path):
+    if not path_obj.exists() or not path_obj.is_dir():
+        return False
+
+    mode_options = sorted(MODE_REGISTRY.keys())
+    for mode_name in mode_options:
+        mode_root = path_obj / mode_name
+        if not mode_root.exists() or not mode_root.is_dir():
+            continue
+        if (mode_root / "mode_manifest.json").exists():
+            return True
+        try:
+            for var_dir in mode_root.iterdir():
+                if not var_dir.is_dir():
+                    continue
+                if (var_dir / "pod_modes.npy").exists() or (var_dir / "dmd_modes.npy").exists():
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def _pick_latest_models_root_candidate(candidates: list[Path]):
+    if not candidates:
+        return None
+    scored = []
+    for path_obj in candidates:
+        try:
+            ts = float(path_obj.stat().st_mtime)
+        except OSError:
+            ts = 0.0
+        scored.append((ts, path_obj))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[0][1]
+
+
+def _has_mode_trainer_combo(models_root: Path, mode_name: str, trainer_name: str):
+    root = Path(models_root)
+    mode_root = root / str(mode_name)
+    if not mode_root.exists() or not mode_root.is_dir():
+        return False
+
+    try:
+        mode_vars = {d.name for d in mode_root.iterdir() if d.is_dir()}
+    except OSError:
+        return False
+    if not mode_vars:
+        return False
+
+    if str(mode_name).strip().lower() == "dmd":
+        for var_name in mode_vars:
+            if (mode_root / var_name / "dmd_modes.npy").exists():
+                return True
+        return False
+
+    trainer_root = root / str(trainer_name) / str(mode_name)
+    if not trainer_root.exists() or not trainer_root.is_dir():
+        return False
+
+    trained_vars = set()
+    for var_name in mode_vars:
+        model_file = trainer_root / var_name / f"{trainer_name}_model.pkl"
+        if model_file.exists():
+            trained_vars.add(var_name)
+    return bool(mode_vars & trained_vars)
+
+
+def _has_mode_artifacts(models_root: Path, mode_name: str):
+    root = Path(models_root)
+    mode_root = root / str(mode_name)
+    if not mode_root.exists() or not mode_root.is_dir():
+        return False
+    try:
+        mode_vars = [d for d in mode_root.iterdir() if d.is_dir()]
+    except OSError:
+        return False
+    if not mode_vars:
+        return False
+    for var_dir in mode_vars:
+        if (var_dir / "pod_modes.npy").exists() or (var_dir / "dmd_modes.npy").exists():
+            return True
+    return (mode_root / "mode_manifest.json").exists()
+
+
+def _normalize_models_dir_for_viewer(models_dir_text: str):
+    raw = Path(models_dir_text).expanduser()
+    if _is_models_root_candidate(raw):
+        return str(raw), None
+
+    # Users often pass trainer subpaths like <profile>/nn or <profile>/nn/pod.
+    # Walk up a few levels and pick the nearest valid ROM models root.
+    current = raw
+    for _ in range(6):
+        parent = current.parent
+        if parent == current:
+            break
+        if _is_models_root_candidate(parent):
+            return (
+                str(parent),
+                f"`models-dir` looks like a trainer subfolder. Using ROM root `{parent}` instead.",
+            )
+        current = parent
+
+    # If a container directory is given, pick the most recent valid profile root.
+    try:
+        direct_candidates = [d for d in raw.iterdir() if d.is_dir() and _is_models_root_candidate(d)]
+    except OSError:
+        direct_candidates = []
+    direct_pick = _pick_latest_models_root_candidate(direct_candidates)
+    if direct_pick is not None:
+        return (
+            str(direct_pick),
+            f"`models-dir` is a container directory. Using latest ROM root `{direct_pick}`.",
+        )
+
+    # Common workspace layout: <models>/catalog/<profile>/...
+    catalog_root = raw / MODEL_PROFILE_DIRNAME
+    if catalog_root.exists() and catalog_root.is_dir():
+        try:
+            catalog_candidates = [d for d in catalog_root.iterdir() if d.is_dir() and _is_models_root_candidate(d)]
+        except OSError:
+            catalog_candidates = []
+        catalog_pick = _pick_latest_models_root_candidate(catalog_candidates)
+        if catalog_pick is not None:
+            return (
+                str(catalog_pick),
+                f"`models-dir` points to workspace models root. Using latest catalog profile `{catalog_pick}`.",
+            )
+    return str(raw), None
+
+
+def _resolve_models_dir_for_viewer_combo(models_dir_text: str, mode_name: str, trainer_name: str):
+    normalized_text, _ = _normalize_models_dir_for_viewer(models_dir_text)
+    normalized = Path(normalized_text)
+    if _has_mode_trainer_combo(normalized, mode_name, trainer_name):
+        return str(normalized), None
+
+    raw = Path(models_dir_text).expanduser()
+    candidates = []
+    seen = set()
+
+    def _add_candidate(path_obj: Path):
+        try:
+            key = str(path_obj.resolve())
+        except OSError:
+            key = str(path_obj)
+        if key in seen:
+            return
+        seen.add(key)
+        if _is_models_root_candidate(path_obj) and _has_mode_trainer_combo(path_obj, mode_name, trainer_name):
+            candidates.append(path_obj)
+
+    # direct and normalized first
+    _add_candidate(raw)
+    _add_candidate(normalized)
+
+    # walk ancestors from raw
+    current = raw
+    for _ in range(6):
+        parent = current.parent
+        if parent == current:
+            break
+        _add_candidate(parent)
+        current = parent
+
+    # direct children of raw
+    try:
+        for child in raw.iterdir():
+            if child.is_dir():
+                _add_candidate(child)
+    except OSError:
+        pass
+
+    # catalog children under raw
+    catalog_root = raw / MODEL_PROFILE_DIRNAME
+    if catalog_root.exists() and catalog_root.is_dir():
+        try:
+            for child in catalog_root.iterdir():
+                if child.is_dir():
+                    _add_candidate(child)
+        except OSError:
+            pass
+
+    picked = _pick_latest_models_root_candidate(candidates)
+    if picked is not None:
+        return (
+            str(picked),
+            f"Resolved ROM root for mode=`{mode_name}`, trainer=`{trainer_name}` -> `{picked}`",
+        )
+
+    mode_only_candidates = []
+    seen_mode_only = set()
+
+    def _add_mode_only(path_obj: Path):
+        try:
+            key = str(path_obj.resolve())
+        except OSError:
+            key = str(path_obj)
+        if key in seen_mode_only:
+            return
+        seen_mode_only.add(key)
+        if _is_models_root_candidate(path_obj) and _has_mode_artifacts(path_obj, mode_name):
+            mode_only_candidates.append(path_obj)
+
+    _add_mode_only(raw)
+    _add_mode_only(normalized)
+    current = raw
+    for _ in range(6):
+        parent = current.parent
+        if parent == current:
+            break
+        _add_mode_only(parent)
+        current = parent
+    try:
+        for child in raw.iterdir():
+            if child.is_dir():
+                _add_mode_only(child)
+    except OSError:
+        pass
+    catalog_root = raw / MODEL_PROFILE_DIRNAME
+    if catalog_root.exists() and catalog_root.is_dir():
+        try:
+            for child in catalog_root.iterdir():
+                if child.is_dir():
+                    _add_mode_only(child)
+        except OSError:
+            pass
+
+    picked_mode_only = _pick_latest_models_root_candidate(mode_only_candidates)
+    if picked_mode_only is not None:
+        return (
+            str(picked_mode_only),
+            (
+                f"Resolved ROM root for mode=`{mode_name}` -> `{picked_mode_only}`. "
+                f"Trainer `{trainer_name}` artifacts were not found."
+            ),
+        )
+
+    return (
+        str(normalized),
+        (
+            f"Could not find a ROM root containing mode=`{mode_name}`, trainer=`{trainer_name}` "
+            f"under `{models_dir_text}`. Using `{normalized}`."
+        ),
+    )
 
 
 def _derive_subset_peer_dir(path_text: str | Path, target_subset: str):
@@ -564,12 +888,20 @@ def _discover_registered_rom_combos(profile_root_text: str):
         for mode_name, mode_info in (profile.get("mode_details") or {}).items():
             trainers = mode_info.get("trainers") or {}
             for trainer_name, trained_vars in trainers.items():
-                trainer_root = profile_path / trainer_name / mode_name
-                trainer_manifest = _safe_read_json(trainer_root / "trainer_manifest.json") or {}
-                try:
-                    updated_ts = trainer_root.stat().st_mtime
-                except OSError:
-                    updated_ts = float(profile.get("updated_ts", 0.0))
+                if str(trainer_name).strip().lower() == NO_TRAINER_NAME:
+                    trainer_root = profile_path / mode_name
+                    trainer_manifest = {}
+                    try:
+                        updated_ts = trainer_root.stat().st_mtime
+                    except OSError:
+                        updated_ts = float(profile.get("updated_ts", 0.0))
+                else:
+                    trainer_root = profile_path / trainer_name / mode_name
+                    trainer_manifest = _safe_read_json(trainer_root / "trainer_manifest.json") or {}
+                    try:
+                        updated_ts = trainer_root.stat().st_mtime
+                    except OSError:
+                        updated_ts = float(profile.get("updated_ts", 0.0))
 
                 combos.append(
                     {
@@ -675,7 +1007,9 @@ def _render_mode_docs(mode_name: str):
 
 def _render_trainer_docs(trainer_name: str):
     st.caption(TRAINER_DESCRIPTIONS.get(trainer_name, "Trainer parameter help"))
-    if trainer_name == "rbf":
+    if trainer_name == NO_TRAINER_NAME:
+        st.info("No offline trainer is used. DMD reconstructs the field directly from modal dynamics.")
+    elif trainer_name == "rbf":
         st.info(
             "`kernel`: RBF kernel type\n"
             "`epsilon`: kernel scale parameter"
@@ -684,7 +1018,7 @@ def _render_trainer_docs(trainer_name: str):
         st.info(
             "`hidden_dims`: hidden layer widths (comma-separated)\n"
             "`activation`: activation label\n"
-            "`epochs`: training epochs (metadata in current baseline)"
+            "`epochs`: optimization iterations for MLP fitting"
         )
     elif trainer_name == "projection":
         st.info(
@@ -1303,6 +1637,10 @@ def _render_mode_controls(mode_name: str, key_prefix: str):
 
 def _render_trainer_controls(trainer_name: str, key_prefix: str):
     _render_trainer_docs(trainer_name)
+    if trainer_name == NO_TRAINER_NAME:
+        st.caption("`trainer=none` is intended for DMD direct reconstruction.")
+        return {}, "{}"
+
     trainer_params = {}
     if trainer_name == "rbf":
         trainer_params["kernel"] = st.selectbox(
@@ -1340,7 +1678,7 @@ def _render_trainer_controls(trainer_name: str, key_prefix: str):
             st.number_input(
                 "epochs",
                 min_value=1,
-                value=200,
+                value=600,
                 step=10,
                 key=f"{key_prefix}_epochs",
                 help="Training epochs.",
@@ -1911,7 +2249,7 @@ def main():
         st.subheader("Offline Training")
         key_base = f"{session.session_id}_offline"
         mode_options = sorted(MODE_REGISTRY.keys())
-        trainer_options = sorted(TRAINER_REGISTRY.keys())
+        trainer_options = _trainer_ui_options()
 
         profile_source = st.radio(
             "mode-profile-source",
@@ -2005,12 +2343,25 @@ def main():
                 help_text=FIELD_HELP["processed_dir"],
             )
 
-        trainer_name = st.selectbox(
-            "trainer",
-            options=trainer_options,
-            key=f"{key_base}_trainer_name",
-            help=FIELD_HELP["trainer"],
+        trainer_key = f"{key_base}_trainer_name"
+        default_trainer = _default_trainer_name(mode_name)
+        if trainer_key not in st.session_state or st.session_state.get(trainer_key) not in trainer_options:
+            st.session_state[trainer_key] = default_trainer if default_trainer in trainer_options else trainer_options[0]
+        trainer_name = st.selectbox("trainer", options=trainer_options, key=trainer_key, help=FIELD_HELP["trainer"])
+        if _mode_uses_offline_trainer(mode_name) and _is_none_trainer_name(trainer_name):
+            st.warning("`trainer=none` is only valid for `mode=dmd`.")
+        elif not _mode_uses_offline_trainer(mode_name) and not _is_none_trainer_name(trainer_name):
+            st.caption("DMD는 offline trainer 없이 동작합니다. 선택한 trainer는 참고용이며 `none` 권장.")
+
+        models_dir_effective_text, models_dir_combo_note = _resolve_models_dir_for_viewer_combo(
+            models_dir_text=models_dir_text,
+            mode_name=mode_name,
+            trainer_name=trainer_name,
         )
+        if models_dir_combo_note:
+            st.caption(models_dir_combo_note)
+        if models_dir_effective_text != models_dir_text:
+            st.caption(f"Resolved models-dir for run: `{models_dir_effective_text}`")
 
         default_columns = ["time"]
         current_doe = Path(processed_dir_text) / "doe.csv"
@@ -2038,7 +2389,7 @@ def main():
         cmd_parts = [
             "python scripts/run_offline_training.py",
             f"--processed-dir {_quote(processed_dir_text)}",
-            f"--models-dir {_quote(models_dir_text)}",
+            f"--models-dir {_quote(models_dir_effective_text)}",
             f"--mode {mode_name}",
             f"--trainer {trainer_name}",
             f"--input-column {input_column}",
@@ -2073,7 +2424,7 @@ def main():
                     "mode_profile_source": profile_source,
                     "mode_profile_name": None if selected_profile is None else selected_profile.get("name"),
                     "processed_link": processed_link,
-                    "models_dir": models_dir_text,
+                    "models_dir": models_dir_effective_text,
                     "mode_name": mode_name,
                     "trainer_name": trainer_name,
                     "trainer_params": trainer_kwargs,
@@ -2089,7 +2440,7 @@ def main():
                         request=request,
                         action=lambda: run_offline_training(
                             processed_dir=Path(processed_dir_text),
-                            models_dir=Path(models_dir_text),
+                            models_dir=Path(models_dir_effective_text),
                             mode_name=mode_name,
                             trainer_name=trainer_name,
                             trainer_params=trainer_kwargs,
@@ -2110,7 +2461,7 @@ def main():
         st.subheader("Online Prediction")
         key_base = f"{session.session_id}_online"
         mode_options = sorted(MODE_REGISTRY.keys())
-        trainer_options = sorted(TRAINER_REGISTRY.keys())
+        trainer_options = _trainer_ui_options()
         runner_options = sorted(RUNNER_REGISTRY.keys())
         time_value = float(
             st.number_input(
@@ -2128,6 +2479,10 @@ def main():
             key=f"{key_base}_models",
             help_text=FIELD_HELP["models_dir"],
         )
+        models_dir_resolved_text, models_dir_note = _normalize_models_dir_for_viewer(models_dir_text)
+        if models_dir_note:
+            st.info(models_dir_note)
+            st.caption(f"Resolved models-dir: `{models_dir_resolved_text}`")
         processed_dir_text = _directory_input(
             "processed-dir",
             value=str(session.processed_dir),
@@ -2146,12 +2501,26 @@ def main():
             key=f"{key_base}_mode_name",
             help=FIELD_HELP["mode"],
         )
-        trainer_name = st.selectbox(
-            "trainer",
-            options=trainer_options,
-            key=f"{key_base}_trainer_name",
-            help=FIELD_HELP["trainer"],
+        trainer_key = f"{key_base}_trainer_name"
+        default_trainer = _default_trainer_name(mode_name)
+        if trainer_key not in st.session_state or st.session_state.get(trainer_key) not in trainer_options:
+            st.session_state[trainer_key] = default_trainer if default_trainer in trainer_options else trainer_options[0]
+        trainer_name = st.selectbox("trainer", options=trainer_options, key=trainer_key, help=FIELD_HELP["trainer"])
+        if _mode_uses_offline_trainer(mode_name) and _is_none_trainer_name(trainer_name):
+            st.warning("`trainer=none` is only valid for `mode=dmd`.")
+        elif not _mode_uses_offline_trainer(mode_name) and not _is_none_trainer_name(trainer_name):
+            st.caption("DMD는 trainer 없이 재구성됩니다. `trainer=none` 권장.")
+
+        models_dir_effective_text, models_dir_combo_note = _resolve_models_dir_for_viewer_combo(
+            models_dir_text=models_dir_resolved_text,
+            mode_name=mode_name,
+            trainer_name=trainer_name,
         )
+        if models_dir_combo_note:
+            st.caption(models_dir_combo_note)
+        if models_dir_effective_text != models_dir_text:
+            st.caption(f"Resolved models-dir for run: `{models_dir_effective_text}`")
+
         runner_name = st.selectbox(
             "runner",
             options=runner_options,
@@ -2166,7 +2535,7 @@ def main():
                 [
                     "python scripts/run_online_prediction.py",
                     f"{time_value}",
-                    f"--models-dir {_quote(models_dir_text)}",
+                    f"--models-dir {_quote(models_dir_effective_text)}",
                     f"--processed-dir {_quote(processed_dir_text)}",
                     f"--output-dir {_quote(output_dir_text)}",
                     f"--mode {mode_name}",
@@ -2182,7 +2551,7 @@ def main():
         if submitted:
             request = {
                 "time_value": time_value,
-                "models_dir": models_dir_text,
+                "models_dir": models_dir_effective_text,
                 "processed_dir": processed_dir_text,
                 "output_dir": output_dir_text,
                 "mode_name": mode_name,
@@ -2196,7 +2565,7 @@ def main():
                     request=request,
                     action=lambda: run_online_prediction(
                         time_value=time_value,
-                        models_dir=Path(models_dir_text),
+                        models_dir=Path(models_dir_effective_text),
                         processed_dir=Path(processed_dir_text),
                         output_dir=Path(output_dir_text),
                         mode_name=mode_name,
@@ -2214,7 +2583,7 @@ def main():
         st.caption("선택한 ROM 프로필과 test 데이터셋으로 R2/1-R2 평가를 수행합니다.")
         key_base = f"{session.session_id}_evaluate"
         mode_options = sorted(MODE_REGISTRY.keys())
-        trainer_options = sorted(TRAINER_REGISTRY.keys())
+        trainer_options = _trainer_ui_options()
 
         model_profile_root = _model_profile_root(session)
         processed_catalog_root = _processed_catalog_root(session)
@@ -2261,7 +2630,11 @@ def main():
                     "\n".join(
                         [
                             f"Mode artifacts   : {Path(models_dir_text) / mode_name}",
-                            f"Trainer artifacts: {Path(models_dir_text) / trainer_name / mode_name}",
+                            (
+                                f"Trainer artifacts: {Path(models_dir_text) / trainer_name / mode_name}"
+                                if not _is_none_trainer_name(trainer_name)
+                                else "Trainer artifacts: (not required for DMD direct reconstruction)"
+                            ),
                         ]
                     ),
                     language="text",
@@ -2277,13 +2650,17 @@ def main():
                 key=f"{key_base}_models",
                 help_text=FIELD_HELP["models_dir"],
             )
+            models_dir_detect_text, models_dir_detect_note = _normalize_models_dir_for_viewer(models_dir_text)
+            if models_dir_detect_note:
+                st.caption(models_dir_detect_note)
+                st.caption(f"Auto-detect base models-dir: `{models_dir_detect_text}`")
             auto_detect_rom = st.checkbox(
                 "Auto detect mode/trainer from models-dir",
                 value=True,
                 key=f"{key_base}_auto_detect",
                 help="trainer_manifest/mode_manifest를 읽어 mode/trainer를 자동 선택합니다.",
             )
-            detected = _discover_rom_profiles(models_dir_text) if auto_detect_rom else []
+            detected = _discover_rom_profiles(models_dir_detect_text) if auto_detect_rom else []
             if detected:
                 labels = []
                 for item in detected:
@@ -2311,12 +2688,33 @@ def main():
                     key=f"{key_base}_mode_manual",
                     help=FIELD_HELP["mode"],
                 )
-                trainer_name = st.selectbox(
-                    "trainer",
-                    options=trainer_options,
-                    key=f"{key_base}_trainer_manual",
-                    help=FIELD_HELP["trainer"],
-                )
+                trainer_key = f"{key_base}_trainer_manual"
+                default_trainer = _default_trainer_name(mode_name)
+                if trainer_key not in st.session_state or st.session_state.get(trainer_key) not in trainer_options:
+                    st.session_state[trainer_key] = (
+                        default_trainer if default_trainer in trainer_options else trainer_options[0]
+                    )
+                trainer_name = st.selectbox("trainer", options=trainer_options, key=trainer_key, help=FIELD_HELP["trainer"])
+
+        if mode_name is None:
+            mode_name = mode_options[0]
+        if trainer_name is None:
+            trainer_name = _default_trainer_name(mode_name)
+
+        if _mode_uses_offline_trainer(mode_name) and _is_none_trainer_name(trainer_name):
+            st.warning("`trainer=none` is only valid for `mode=dmd`.")
+        elif not _mode_uses_offline_trainer(mode_name) and not _is_none_trainer_name(trainer_name):
+            st.caption("DMD는 trainer 없이 재구성됩니다. `trainer=none` 권장.")
+
+        models_dir_effective_text, models_dir_combo_note = _resolve_models_dir_for_viewer_combo(
+            models_dir_text=models_dir_text,
+            mode_name=mode_name,
+            trainer_name=trainer_name,
+        )
+        if models_dir_combo_note:
+            st.caption(models_dir_combo_note)
+        if models_dir_effective_text != models_dir_text:
+            st.caption(f"Resolved models-dir for run: `{models_dir_effective_text}`")
 
         inferred_test_dir = None
         if selected_rom is not None:
@@ -2433,7 +2831,7 @@ def main():
                 [
                     "python scripts/run_test_evaluation.py",
                     f"--processed-test-dir {_quote(processed_test_dir_text)}",
-                    f"--models-dir {_quote(models_dir_text)}",
+                    f"--models-dir {_quote(models_dir_effective_text)}",
                     f"--output-dir {_quote(output_dir_text)}",
                     f"--mode {mode_name}",
                     f"--trainer {trainer_name}",
@@ -2448,7 +2846,7 @@ def main():
                 "rom_profile_name": None if selected_rom is None else selected_rom.get("profile_name"),
                 "test_dataset_source": test_source,
                 "processed_test_dir": processed_test_dir_text,
-                "models_dir": models_dir_text,
+                "models_dir": models_dir_effective_text,
                 "output_dir": output_dir_text,
                 "mode_name": mode_name,
                 "trainer_name": trainer_name,
@@ -2461,7 +2859,7 @@ def main():
                     request=request,
                     action=lambda: run_test_evaluation(
                         processed_test_dir=Path(processed_test_dir_text),
-                        models_dir=Path(models_dir_text),
+                        models_dir=Path(models_dir_effective_text),
                         mode_name=mode_name,
                         trainer_name=trainer_name,
                         output_dir=Path(output_dir_text),
@@ -2474,18 +2872,21 @@ def main():
             record = st.session_state[f"{key_base}_last_record"]
             _render_record(record)
             summary = record.get("summary") or {}
-            r2_plot_path = Path(summary.get("r2_plot_path", ""))
-            if record.get("status") == "success" and r2_plot_path.exists():
-                st.image(str(r2_plot_path), caption="R2 Diagnostics", use_container_width=True)
+            eval_plot_path = Path(summary.get("evaluation_plot_path") or summary.get("r2_plot_path", ""))
+            if record.get("status") == "success" and eval_plot_path.exists():
+                st.image(str(eval_plot_path), caption="Evaluation Diagnostics (R2 + L2)", use_container_width=True)
 
-            r2_by_time_path = Path(summary.get("r2_by_time_path", ""))
-            if record.get("status") == "success" and r2_by_time_path.exists():
+            eval_by_time_path = Path(summary.get("evaluation_by_time_path") or summary.get("r2_by_time_path", ""))
+            if record.get("status") == "success" and eval_by_time_path.exists():
                 try:
-                    eval_df = pd.read_csv(r2_by_time_path)
+                    eval_df = pd.read_csv(eval_by_time_path)
                 except Exception:  # noqa: BLE001
                     eval_df = pd.DataFrame()
 
-                if not eval_df.empty and {"time", "variable", "r2", "r2_error"}.issubset(set(eval_df.columns)):
+                has_l2_pct_curve = {"time", "variable", "r2", "l2_error_pct"}.issubset(set(eval_df.columns))
+                has_l2_curve = {"time", "variable", "r2", "l2_error"}.issubset(set(eval_df.columns))
+                has_legacy_curve = {"time", "variable", "r2", "r2_error"}.issubset(set(eval_df.columns))
+                if not eval_df.empty and (has_l2_pct_curve or has_l2_curve or has_legacy_curve):
                     st.markdown("**Evaluation Curves**")
                     variable_options = sorted(eval_df["variable"].astype(str).unique().tolist())
                     selected_variable = st.selectbox(
@@ -2494,7 +2895,16 @@ def main():
                         key=f"{key_base}_curve_variable",
                     )
                     var_df = eval_df[eval_df["variable"] == selected_variable].sort_values("time")
-                    curve_df = var_df.set_index("time")[["r2", "r2_error"]]
+                    if "l2_error_pct" in var_df.columns:
+                        curve_df = var_df.set_index("time")[["r2", "l2_error_pct"]]
+                        curve_df = curve_df.rename(columns={"r2": "R2", "l2_error_pct": "L2 error (%)"})
+                    elif "l2_error" in var_df.columns:
+                        curve_df = var_df.set_index("time")[["r2", "l2_error"]]
+                        curve_df = curve_df.rename(columns={"r2": "R2", "l2_error": "L2 error (raw norm)"})
+                        st.caption("`l2_error_pct`가 없어 raw L2 norm을 표시 중입니다. 퍼센트 표시는 Evaluate를 다시 실행해 주세요.")
+                    else:
+                        curve_df = var_df.set_index("time")[["r2", "r2_error"]]
+                        curve_df = curve_df.rename(columns={"r2": "R2", "r2_error": "R2 error"})
                     st.line_chart(curve_df, use_container_width=True)
 
             with st.expander("3D Compare: Ground Truth vs Prediction", expanded=False):
@@ -2570,7 +2980,7 @@ def main():
                                     )[keep]
 
                                     runner = OnlinePredictionRunner(
-                                        models_dir=Path(models_dir_text),
+                                        models_dir=Path(models_dir_effective_text),
                                         mode_name=str(mode_name),
                                         trainer_name=str(trainer_name),
                                     )
@@ -2608,7 +3018,7 @@ def main():
         st.subheader("Full Pipeline")
         key_base = f"{session.session_id}_pipeline"
         mode_options = sorted(MODE_REGISTRY.keys())
-        trainer_options = sorted(TRAINER_REGISTRY.keys())
+        trainer_options = _trainer_ui_options()
         runner_options = sorted(RUNNER_REGISTRY.keys())
         raw_dir_text = _directory_input(
             "raw-dir",
@@ -2640,12 +3050,15 @@ def main():
             key=f"{key_base}_mode_name",
             help=FIELD_HELP["mode"],
         )
-        trainer_name = st.selectbox(
-            "trainer",
-            options=trainer_options,
-            key=f"{key_base}_trainer_name",
-            help=FIELD_HELP["trainer"],
-        )
+        trainer_key = f"{key_base}_trainer_name"
+        default_trainer = _default_trainer_name(mode_name)
+        if trainer_key not in st.session_state or st.session_state.get(trainer_key) not in trainer_options:
+            st.session_state[trainer_key] = default_trainer if default_trainer in trainer_options else trainer_options[0]
+        trainer_name = st.selectbox("trainer", options=trainer_options, key=trainer_key, help=FIELD_HELP["trainer"])
+        if _mode_uses_offline_trainer(mode_name) and _is_none_trainer_name(trainer_name):
+            st.warning("`trainer=none` is only valid for `mode=dmd`.")
+        elif not _mode_uses_offline_trainer(mode_name) and not _is_none_trainer_name(trainer_name):
+            st.caption("DMD는 trainer 없이 재구성됩니다. `trainer=none` 권장.")
         runner_name = st.selectbox(
             "runner",
             options=runner_options,
@@ -2776,7 +3189,7 @@ def main():
 
         key_base = f"{session.session_id}_viewer"
         mode_options = sorted(MODE_REGISTRY.keys())
-        trainer_options = sorted(TRAINER_REGISTRY.keys())
+        trainer_options = _trainer_ui_options()
 
         models_dir_text = _directory_input(
             "models-dir",
@@ -2784,6 +3197,10 @@ def main():
             key=f"{key_base}_models",
             help_text=FIELD_HELP["models_dir"],
         )
+        models_dir_resolved_text, models_dir_note = _normalize_models_dir_for_viewer(models_dir_text)
+        if models_dir_note:
+            st.info(models_dir_note)
+            st.caption(f"Resolved models-dir: `{models_dir_resolved_text}`")
         processed_dir_text = _directory_input(
             "processed-dir",
             value=str(session.processed_dir),
@@ -2797,7 +3214,7 @@ def main():
             key=f"{key_base}_auto_profile",
             help="mode_manifest/trainer_manifest를 읽어 mode/trainer를 자동 선택합니다.",
         )
-        discovered_profiles = _discover_rom_profiles(models_dir_text)
+        discovered_profiles = _discover_rom_profiles(models_dir_resolved_text)
         selected_profile = None
         if auto_profile:
             if discovered_profiles:
@@ -2831,8 +3248,11 @@ def main():
                 st.info("No auto-detectable profile found under models-dir. Falling back to manual selection.")
 
         viewer_lock_mode_trainer = auto_profile and selected_profile is not None
-        mode_default = selected_profile["mode_name"] if selected_profile else mode_options[0]
-        trainer_default = selected_profile["trainer_name"] if selected_profile else trainer_options[0]
+        mode_default = selected_profile["mode_name"] if selected_profile else ("pod" if "pod" in mode_options else mode_options[0])
+        trainer_default = selected_profile["trainer_name"] if selected_profile else _default_trainer_name(mode_default)
+        if trainer_default not in trainer_options:
+            fallback_trainer = _default_trainer_name(mode_default)
+            trainer_default = fallback_trainer if fallback_trainer in trainer_options else trainer_options[0]
         mode_index = mode_options.index(mode_default) if mode_default in mode_options else 0
         trainer_index = trainer_options.index(trainer_default) if trainer_default in trainer_options else 0
         if viewer_lock_mode_trainer:
@@ -2871,6 +3291,10 @@ def main():
                 help=FIELD_HELP["trainer"],
                 disabled=viewer_lock_mode_trainer,
             )
+            if _mode_uses_offline_trainer(mode_name) and _is_none_trainer_name(trainer_name):
+                st.warning("`trainer=none` is only valid for `mode=dmd`.")
+            elif not _mode_uses_offline_trainer(mode_name) and not _is_none_trainer_name(trainer_name):
+                st.caption("DMD는 trainer 없이 재구성됩니다. `trainer=none` 권장.")
             frames = int(
                 st.number_input(
                     "frames",
@@ -2902,6 +3326,14 @@ def main():
                     help="3D 점 크기",
                 )
             )
+
+        models_dir_effective_text, models_dir_combo_note = _resolve_models_dir_for_viewer_combo(
+            models_dir_text=models_dir_text,
+            mode_name=mode_name,
+            trainer_name=trainer_name,
+        )
+        if models_dir_combo_note:
+            st.caption(models_dir_combo_note)
 
         default_viewer_start = 0.005
         default_viewer_end = 0.05
@@ -3010,7 +3442,7 @@ def main():
                 st.error("Invalid time range. Set `end-time` > `start-time`.")
             else:
                 request = {
-                    "models_dir": models_dir_text,
+                    "models_dir": models_dir_effective_text,
                     "processed_dir": processed_dir_text,
                     "mode_name": mode_name,
                     "trainer_name": trainer_name,
@@ -3024,7 +3456,7 @@ def main():
 
                 def _prepare_viewer():
                     bundle = _build_viewer_data(
-                        models_dir=Path(models_dir_text),
+                        models_dir=Path(models_dir_effective_text),
                         processed_dir=Path(processed_dir_text),
                         mode_name=mode_name,
                         trainer_name=trainer_name,
@@ -3130,7 +3562,7 @@ def main():
         )
 
         native_command = _build_native_viewer_command(
-            models_dir=Path(models_dir_text),
+            models_dir=Path(models_dir_effective_text),
             processed_dir=Path(processed_dir_text),
             mode_name=mode_name,
             trainer_name=trainer_name,

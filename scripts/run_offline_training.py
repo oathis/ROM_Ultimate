@@ -8,6 +8,9 @@ from rom.registry.mode_registry import REGISTRY as MODE_REGISTRY
 from rom.registry.trainer_registry import REGISTRY as TRAINER_REGISTRY
 
 
+NO_TRAINER_NAME = "none"
+
+
 def _parse_hidden_dims(raw: str):
     text = (raw or "").strip()
     if not text:
@@ -16,6 +19,7 @@ def _parse_hidden_dims(raw: str):
 
 
 def main():
+    trainer_choices = sorted(TRAINER_REGISTRY.keys()) + [NO_TRAINER_NAME]
     parser = argparse.ArgumentParser(description="Train offline surrogate models from latent trajectories.")
     parser.add_argument("--processed-dir", default=str(ROOT_DIR / "data/processed"), help="Processed directory (contains doe.csv)")
     parser.add_argument("--models-dir", default=str(ROOT_DIR / "models"), help="Root model directory")
@@ -23,14 +27,14 @@ def main():
     parser.add_argument(
         "--trainer",
         default="rbf",
-        choices=sorted(TRAINER_REGISTRY.keys()),
-        help="Offline trainer name (registry key)",
+        choices=trainer_choices,
+        help="Offline trainer name (registry key). Use 'none' for DMD direct reconstruction mode.",
     )
     parser.add_argument("--kernel", default="cubic", help="RBF kernel")
     parser.add_argument("--epsilon", type=float, default=1.0, help="RBF epsilon")
     parser.add_argument("--hidden-dims", default="128,128", help="NN hidden dims as comma-separated ints")
-    parser.add_argument("--activation", default="relu", help="NN activation label")
-    parser.add_argument("--epochs", type=int, default=200, help="NN epochs")
+    parser.add_argument("--activation", default="tanh", help="NN activation label")
+    parser.add_argument("--epochs", type=int, default=600, help="NN epochs")
     parser.add_argument("--solver", default="galerkin", help="Projection solver name")
     parser.add_argument("--stabilization", action="store_true", help="Projection stabilization toggle")
     parser.add_argument("--ridge", type=float, default=1e-8, help="Projection ridge regularization")
@@ -67,7 +71,10 @@ def main():
         min_train_samples=args.min_train_samples,
     )
 
-    print(f"Trainer '{args.trainer}' fitted for {len(summary)} variables.")
+    if args.mode == "dmd" and args.trainer == NO_TRAINER_NAME:
+        print(f"DMD direct reconstruction selected. Offline trainer stage skipped for {len(summary)} variables.")
+    else:
+        print(f"Trainer '{args.trainer}' fitted for {len(summary)} variables.")
     for var, info in summary.items():
         print(f"- {var}: target={info['target_shape']} -> {info['model_path']}")
         val_block = info.get("validation", {})
